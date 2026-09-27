@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+.env
+*.db
+mlruns/
+chroma_data/
+.pytest_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+*.egg-info/
+AGENT_CONTEXT.md
+IMPLEMENTATION_PLAN.md
+SYSTEM_DESIGN.md
+PRD.md

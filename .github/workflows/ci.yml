@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test-and-validate:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    env:
+      ENV: test
+      DATABASE_URL: sqlite:///:memory:
+      REDIS_URL: fake://
+      JWT_SECRET: ci-test-secret
+      RUN_SCHEDULER: "false"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Lint (ruff)
+        run: ruff check app
+      - name: Format check (black)
+        run: black --check app tests
+      - name: Run tests with coverage
+        run: pytest -q --cov=app --cov-report=term-missing
+      - name: Secret scan
+        run: |
+          ! grep -rniE "(api[_-]?key|secret|password|token)\s*=\s*['\"][a-zA-Z0-9]{8,}" app --include="*.py" \
+            | grep -v "settings\.\|os.getenv\|CHANGE_ME"
+      - name: Validate OpenAPI schema loads
+        run: python -c "from app.main import app; assert app.openapi()"
+      - name: Build Docker image
+        run: docker build -f ../docker/Dockerfile.backend -t smart-resort-360-backend:ci ..
