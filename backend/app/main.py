@@ -28,6 +28,8 @@ origins = [
     "http://127.0.0.1:5173",
     "http://localhost:3000",
     "http://127.0.0.1:3000",
+    "https://smart-resort-360-rosy.vercel.app",
+    "https://smart-resort-360-git-main-sohams-projects-e1275eb0.vercel.app/",
 ]
 
 app.add_middleware(
