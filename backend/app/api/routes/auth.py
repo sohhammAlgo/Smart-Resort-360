@@ -11,7 +11,11 @@ from app.schemas.auth import (
     ManagerLoginRequest,
     TokenResponse,
 )
-from app.services.otp_service import generate_and_send_otp, verify_otp
+from app.services.otp_service import (
+    OTPEmailDeliveryError,
+    create_and_send_otp,
+    verify_otp,
+)
 from app.auth.security import verify_secret, create_access_token
 
 router = APIRouter(prefix="/auth", tags=["auth"])
@@ -28,13 +32,18 @@ def guest_request_otp(payload: GuestOTPRequest, db: Session = Depends(get_db)):
         raise HTTPException(
             status_code=404, detail="No active booking found for this email"
         )
-    generate_and_send_otp(payload.email)
+    try:
+        create_and_send_otp(db, payload.email)
+    except OTPEmailDeliveryError as exc:
+        raise HTTPException(
+            status_code=502, detail="OTP email could not be sent"
+        ) from exc
     return {"message": "OTP sent"}
 
 
 @router.post("/guest/verify-otp", response_model=TokenResponse)
 def guest_verify_otp(payload: GuestOTPVerify, db: Session = Depends(get_db)):
-    if not verify_otp(payload.email, payload.otp):
+    if not verify_otp(db, payload.email, payload.otp):
         raise HTTPException(status_code=401, detail="Invalid or expired OTP")
     booking = db.query(Booking).filter(Booking.email == payload.email).first()
     token = create_access_token(

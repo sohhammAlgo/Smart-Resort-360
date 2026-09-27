@@ -1,7 +1,7 @@
 """API-level tests for preserved Phase 0-8 flows: auth, buggy, folio/checkout,
 tickets, and emergency — exercised through the FastAPI TestClient."""
 
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 import pytest
 from fastapi.testclient import TestClient
@@ -10,6 +10,7 @@ from app.main import app
 from app.db.session import get_db
 from app.models.employee import Employee
 from app.models.booking import Booking
+from app.models.otp import OTPVerification
 from app.auth.security import hash_secret
 
 
@@ -49,7 +50,18 @@ def test_staff_login_success_and_failure(client, db_session):
     assert bad.status_code == 401
 
 
-def test_guest_otp_requires_active_booking(client, db_session):
+def test_guest_otp_requires_active_booking(client, db_session, monkeypatch):
+    sent_otps = []
+    generated_otps = iter(("1234", "5678", "9012", "3456"))
+    monkeypatch.setattr(
+        "app.services.otp_service.generate_otp",
+        lambda: next(generated_otps),
+    )
+    monkeypatch.setattr(
+        "app.services.otp_service.send_otp_email",
+        lambda email, otp, ttl_seconds: sent_otps.append(otp),
+    )
+
     resp = client.post("/auth/guest/request-otp", json={"email": "nobody@example.com"})
     assert resp.status_code == 404
 
@@ -65,6 +77,68 @@ def test_guest_otp_requires_active_booking(client, db_session):
     db_session.commit()
     resp2 = client.post("/auth/guest/request-otp", json={"email": "guest@example.com"})
     assert resp2.status_code == 200
+    first_otp = sent_otps[-1]
+    assert len(first_otp) == 4
+    assert db_session.query(OTPVerification).filter_by(otp=first_otp).one()
+
+    invalid = client.post(
+        "/auth/guest/verify-otp",
+        json={"email": "guest@example.com", "otp": "0000"},
+    )
+    assert invalid.status_code == 401
+
+    resp3 = client.post("/auth/guest/request-otp", json={"email": "guest@example.com"})
+    assert resp3.status_code == 200
+    newest_otp = sent_otps[-1]
+    assert newest_otp != first_otp
+
+    old_code = client.post(
+        "/auth/guest/verify-otp",
+        json={"email": "guest@example.com", "otp": first_otp},
+    )
+    assert old_code.status_code == 401
+
+    verified = client.post(
+        "/auth/guest/verify-otp",
+        json={"email": "guest@example.com", "otp": newest_otp},
+    )
+    assert verified.status_code == 200
+
+    reused = client.post(
+        "/auth/guest/verify-otp",
+        json={"email": "guest@example.com", "otp": newest_otp},
+    )
+    assert reused.status_code == 401
+
+    assert client.post(
+        "/auth/guest/request-otp", json={"email": "guest@example.com"}
+    ).status_code == 200
+    expired_otp = sent_otps[-1]
+    expired_record = (
+        db_session.query(OTPVerification).filter_by(otp=expired_otp).one()
+    )
+    expired_record.expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+    db_session.commit()
+    expired = client.post(
+        "/auth/guest/verify-otp",
+        json={"email": "guest@example.com", "otp": expired_otp},
+    )
+    assert expired.status_code == 401
+
+    def fail_email(email, otp, ttl_seconds):
+        raise RuntimeError("SMTP unavailable")
+
+    monkeypatch.setattr("app.services.otp_service.send_otp_email", fail_email)
+    email_failure = client.post(
+        "/auth/guest/request-otp", json={"email": "guest@example.com"}
+    )
+    assert email_failure.status_code == 502
+    assert (
+        db_session.query(OTPVerification)
+        .filter_by(email="guest@example.com", verified=False)
+        .count()
+        == 0
+    )
 
 
 def test_buggy_request_flow(client, db_session):

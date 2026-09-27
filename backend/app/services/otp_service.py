@@ -1,56 +1,101 @@
-"""Guest OTP: 4-digit code, Redis TTL, delivered via smtplib with a dev-console fallback."""
-
-import random
-import smtplib
+import hmac
 import logging
-from email.mime.text import MIMEText
+import secrets
+from datetime import datetime, timedelta, timezone
+
+from sqlalchemy import delete, select, update
+from sqlalchemy.orm import Session
 
 from app.core.config import settings
-from app.db.redis_client import get_redis
+from app.models.otp import OTPVerification
+from app.services.email_service import send_otp_email
 
-logger = logging.getLogger("otp_service")
-
-
-def _otp_key(email: str) -> str:
-    return f"otp:{email.lower()}"
+logger = logging.getLogger(__name__)
 
 
-def generate_and_send_otp(email: str) -> str:
-    otp = "".join(random.choices("0123456789", k=settings.OTP_LENGTH))
-    get_redis().setex(_otp_key(email), settings.OTP_TTL_SECONDS, otp)
-    _send_email(email, otp)
-    return otp
+class OTPEmailDeliveryError(Exception):
+    pass
 
 
-def verify_otp(email: str, otp: str) -> bool:
-    key = _otp_key(email)
-    stored = get_redis().get(key)
-    if stored is None:
-        return False
-    if stored == otp:
-        get_redis().delete(key)
-        return True
-    return False
+def generate_otp() -> str:
+    return f"{secrets.randbelow(10 ** settings.OTP_LENGTH):0{settings.OTP_LENGTH}d}"
 
 
-def _send_email(email: str, otp: str):
-    subject = "Your Smart Resort 360 login code"
-    body = f"Your one-time login code is {otp}. It expires in {settings.OTP_TTL_SECONDS // 60} minutes."
-    if not settings.SMTP_HOST:
-        if settings.EMAIL_DEV_CONSOLE_FALLBACK:
-            logger.info("DEV EMAIL FALLBACK -> to=%s otp=%s", email, otp)
-            return
-        raise RuntimeError("SMTP not configured and dev console fallback disabled")
-    msg = MIMEText(body)
-    msg["Subject"] = subject
-    msg["From"] = settings.SMTP_FROM
-    msg["To"] = email
+def create_and_send_otp(db: Session, email: str) -> None:
+    logger.info("OTP generation started")
+    email = email.strip().lower()
+    otp = generate_otp()
+    expires_at = datetime.now(timezone.utc) + timedelta(
+        seconds=settings.OTP_TTL_SECONDS
+    )
+
+    db.execute(
+        delete(OTPVerification).where(
+            OTPVerification.email == email,
+            OTPVerification.verified.is_(False),
+        )
+    )
+    otp_record = OTPVerification(
+        email=email,
+        otp=otp,
+        expires_at=expires_at,
+        verified=False,
+    )
+
+    db.add(otp_record)
+    db.commit()
+    logger.info("OTP stored successfully for %s", email)
+
     try:
-        with smtplib.SMTP(settings.SMTP_HOST, settings.SMTP_PORT, timeout=10) as server:
-            server.starttls()
-            if settings.SMTP_USER:
-                server.login(settings.SMTP_USER, settings.SMTP_PASSWORD)
-            server.sendmail(settings.SMTP_FROM, [email], msg.as_string())
-    except Exception as exc:  # pragma: no cover - network dependent
-        logger.warning("SMTP send failed (%s); falling back to dev console log", exc)
-        logger.info("DEV EMAIL FALLBACK -> to=%s otp=%s", email, otp)
+        logger.info("Sending OTP email to %s", email)
+        send_otp_email(email, otp, settings.OTP_TTL_SECONDS)
+    except Exception as exc:
+        logger.error("OTP email failed: %s: %s", type(exc).__name__, exc)
+        db.delete(otp_record)
+        db.commit()
+        raise OTPEmailDeliveryError("OTP email delivery failed") from exc
+
+    logger.info("OTP email sent successfully to %s", email)
+
+
+def verify_otp(db: Session, email: str, otp: str) -> bool:
+    email = email.strip().lower()
+    otp_record = db.execute(
+        select(OTPVerification)
+        .where(
+            OTPVerification.email == email,
+            OTPVerification.verified.is_(False),
+        )
+        .order_by(OTPVerification.created_at.desc(), OTPVerification.id.desc())
+        .limit(1)
+    ).scalar_one_or_none()
+
+    if otp_record is None or not hmac.compare_digest(otp_record.otp, otp):
+        return False
+
+    now = datetime.now(timezone.utc)
+    expires_at = otp_record.expires_at
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
+    if expires_at <= now:
+        db.execute(
+            update(OTPVerification)
+            .where(
+                OTPVerification.email == email,
+                OTPVerification.verified.is_(False),
+            )
+            .values(verified=True)
+        )
+        db.commit()
+        return False
+
+    db.execute(
+        update(OTPVerification)
+        .where(
+            OTPVerification.email == email,
+            OTPVerification.verified.is_(False),
+        )
+        .values(verified=True)
+    )
+    db.commit()
+    return True
